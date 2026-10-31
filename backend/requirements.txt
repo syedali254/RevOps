@@ -1,0 +1,14 @@
+# B2B Lead Engine — backend dependencies (Milestone 1)
+# Install:  pip install -r requirements.txt
+
+fastapi==0.137.1
+uvicorn[standard]==0.49.0
+SQLAlchemy==2.0.46
+pydantic==2.13.4
+pydantic-settings==2.12.0
+langgraph==1.2.16
+python-dotenv==1.2.1
+httpx==0.28.1
+
+# tests
+pytest==9.0.3

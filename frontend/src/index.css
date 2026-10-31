@@ -1,0 +1,108 @@
+@import 'tailwindcss';
+
+/*
+  Design tokens — single source of truth for the visual system.
+  A separate agent can refine the look here without touching component logic
+  or any backend code.
+*/
+@theme {
+  /* Surfaces */
+  --color-canvas: #f4f5f7;
+  --color-surface: #ffffff;
+  --color-surface-muted: #fafbfc;
+
+  /* Type */
+  --color-ink: #15171c;
+  --color-ink-muted: #545b68;
+  --color-ink-subtle: #7a8290;
+
+  /* Lines */
+  --color-line: #e6e8ec;
+  --color-line-strong: #d2d6dd;
+
+  /* Single restrained accent */
+  --color-accent-50: #eef1fc;
+  --color-accent-100: #dde3f9;
+  --color-accent-500: #3a56cc;
+  --color-accent-600: #2f48b3;
+  --color-accent-700: #273c95;
+
+  /* Status — used sparingly, never decoratively */
+  --color-ok: #157a4f;
+  --color-ok-bg: #e9f5ef;
+  --color-warn: #8a5a06;
+  --color-warn-bg: #fcf3e4;
+  --color-danger: #b3261e;
+  --color-danger-bg: #fbecea;
+
+  --font-sans:
+    'Inter var', 'Inter', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto,
+    Helvetica, Arial, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace;
+
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 8px;
+
+  --shadow-xs: 0 1px 2px rgba(16, 24, 40, 0.05);
+  --shadow-sm: 0 1px 3px rgba(16, 24, 40, 0.08);
+
+  --text-xs: 0.75rem;
+  --text-sm: 0.8125rem;
+  --text-base: 0.875rem;
+  --text-lg: 1rem;
+  --text-xl: 1.125rem;
+  --text-2xl: 1.375rem;
+}
+
+@layer base {
+  html {
+    -webkit-text-size-adjust: 100%;
+  }
+
+  body {
+    margin: 0;
+    background-color: var(--color-canvas);
+    color: var(--color-ink);
+    font-family: var(--font-sans);
+    font-size: var(--text-base);
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  *,
+  ::after,
+  ::before,
+  ::backdrop,
+  ::file-selector-button {
+    border-color: var(--color-line);
+  }
+
+  h1,
+  h2,
+  h3 {
+    margin: 0;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    color: var(--color-ink);
+  }
+
+  p {
+    margin: 0;
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--color-accent-500);
+    outline-offset: 2px;
+    border-radius: var(--radius-sm);
+  }
+
+  input,
+  select,
+  textarea,
+  button {
+    font: inherit;
+    color: inherit;
+  }
+}
