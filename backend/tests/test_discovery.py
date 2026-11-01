@@ -107,8 +107,8 @@ def test_discovery_run_creates_companies_with_source_records(client, campaign):
         assert len(sources) >= 1
         discovery_source = next((s for s in sources if s["source_type"] == "discovery"), None)
         assert discovery_source is not None
-        # Provider can be any discovery connector (brave, remoteok, yc, tavily, exa)
-        assert discovery_source["provider"] in ("brave", "remoteok", "yc", "tavily", "exa")
+        # Provider can be any discovery connector (brave, remoteok, yc, hn, tavily, exa)
+        assert discovery_source["provider"] in ("brave", "remoteok", "yc", "hn", "tavily", "exa")
         assert discovery_source["status"] == "success_with_results"
         assert discovery_source["source_url"] is not None
         assert discovery_source["retrieved_at"] is not None

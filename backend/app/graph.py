@@ -36,6 +36,7 @@ from .connectors import (
     get_exa_connector,
     get_greenhouse_connector,
     get_gnews_connector,
+    get_hn_connector,
     get_opencorporates_connector,
     get_remoteok_connector,
     get_sec_connector,
@@ -251,6 +252,7 @@ def find_node(state: GraphState) -> dict[str, Any]:
         loop = asyncio.new_event_loop()
         all_candidates = []
         connector_results = []
+        hn_notes: list[str] = []  # best-effort notes; merged into the event details
 
         try:
             # Try Tavily first (live primary)
@@ -258,60 +260,83 @@ def find_node(state: GraphState) -> dict[str, Any]:
             tavily_result = loop.run_until_complete(tavily_connector.discover(query))
             connector_results.append(("tavily", tavily_result))
             if tavily_result.is_success() and tavily_result.candidates:
-                all_candidates.extend(tavily_result.candidates)
+                all_candidates.extend(("tavily", c) for c in tavily_result.candidates)
 
             # Try Exa (live fallback)
             exa_connector = get_exa_connector()
             exa_result = loop.run_until_complete(exa_connector.discover(query))
             connector_results.append(("exa", exa_result))
             if exa_result.is_success() and exa_result.candidates:
-                all_candidates.extend(exa_result.candidates)
+                all_candidates.extend(("exa", c) for c in exa_result.candidates)
 
             # Try Remote OK (live job feed discovery)
             remoteok_connector = get_remoteok_connector()
             remoteok_result = loop.run_until_complete(remoteok_connector.discover(query))
             connector_results.append(("remoteok", remoteok_result))
             if remoteok_result.is_success() and remoteok_result.candidates:
-                all_candidates.extend(remoteok_result.candidates)
+                all_candidates.extend(("remoteok", c) for c in remoteok_result.candidates)
+
+            # Try Hacker News Who-is-Hiring (free, public API, best-effort)
+            hn_connector = get_hn_connector()
+            try:
+                hn_result = loop.run_until_complete(hn_connector.discover(query))
+                connector_results.append(("hn", hn_result))
+                if hn_result.is_success() and hn_result.candidates:
+                    all_candidates.extend(("hn", c) for c in hn_result.candidates)
+            except Exception as hn_exc:  # noqa: BLE001 - HN is optional, never fatal
+                hn_notes.append(
+                    f"Hacker News hiring connector raised an unexpected error and was skipped: "
+                    f"{type(hn_exc).__name__}: {hn_exc}"
+                )
+            finally:
+                try:
+                    # Release the HTTP client on the loop that owns it.
+                    loop.run_until_complete(hn_connector.close())
+                except Exception:  # noqa: BLE001 - cleanup must never matter
+                    pass
 
             # Try YC directory (CSV import if configured)
             yc_connector = get_yc_connector()
             yc_result = loop.run_until_complete(yc_connector.discover(query))
             connector_results.append(("yc", yc_result))
             if yc_result.is_success() and yc_result.candidates:
-                all_candidates.extend(yc_result.candidates)
+                all_candidates.extend(("yc", c) for c in yc_result.candidates)
 
             # Try Brave (fixture fallback)
             brave_connector = get_brave_connector()
             brave_result = loop.run_until_complete(brave_connector.discover(query))
             connector_results.append(("brave", brave_result))
             if brave_result.is_success() and brave_result.candidates:
-                all_candidates.extend(brave_result.candidates)
+                all_candidates.extend(("brave", c) for c in brave_result.candidates)
         finally:
             loop.close()
 
         # Deduplicate by domain
         seen_domains = set()
-        unique_candidates = []
-        for candidate in all_candidates:
+        unique_candidates = []  # (provider_name, candidate)
+        for provider_name, candidate in all_candidates:
             domain = candidate.normalized_domain()
             if domain and domain not in seen_domains:
                 seen_domains.add(domain)
-                unique_candidates.append(candidate)
-            elif not domain and candidate.name not in [c.name for c in unique_candidates]:
+                unique_candidates.append((provider_name, candidate))
+            elif not domain and candidate.name not in [c.name for _, c in unique_candidates]:
                 # No domain but unique name - keep
-                unique_candidates.append(candidate)
+                unique_candidates.append((provider_name, candidate))
 
         # Limit to max_results
         candidates = unique_candidates[:query.max_results]
 
+        # Per-candidate provenance: each candidate carries the connector that
+        # produced it, so source records can be attributed honestly.
+        results_by_name = dict(connector_results)
+
         # Determine overall status and primary connector for reporting
-        live_results = [r for name, r in connector_results if name in ("tavily", "exa", "remoteok") and r.is_success()]
+        live_results = [r for name, r in connector_results if name in ("tavily", "exa", "remoteok", "hn") and r.is_success()]
         if live_results:
             # Use first live connector with results as primary
-            primary = next(r for name, r in connector_results if name in ("tavily", "exa", "remoteok") and r.candidates)
-            connector = primary[1] if isinstance(primary, tuple) else primary
-            connector_status = primary[1].status.value if isinstance(primary, tuple) else primary.status.value
+            primary = next((c for c in connector_results if c[1].candidates), None)
+            connector = primary[1] if primary else None
+            connector_status = connector.status.value if connector else "unknown"
         else:
             # Fall back to first connector
             connector = connector_results[0][1] if connector_results else brave_result
@@ -319,8 +344,9 @@ def find_node(state: GraphState) -> dict[str, Any]:
 
         error_code = None
         error_message = None
+        # HN is best-effort: a failure there is recorded, but does not stop discovery.
         for name, result in connector_results:
-            if result.status == ConnectorStatus.FAILED:
+            if result.status == ConnectorStatus.FAILED and name != "hn":
                 error_code = result.error_code
                 error_message = result.error_message
                 break
@@ -338,6 +364,16 @@ def find_node(state: GraphState) -> dict[str, Any]:
             },
         }
 
+        # Best-effort HN notes: keep the event honestly degraded instead of failing.
+        if event_details["connector_statuses"].get("hn") == ConnectorStatus.FAILED.value:
+            hn_notes.append(
+                "Hacker News hiring connector is currently unavailable — discovery "
+                "continued with the remaining sources."
+            )
+        if hn_notes:
+            event_details["hn_notes"] = hn_notes
+            findings.extend(hn_notes)
+
         if error_code:
             findings.append(
                 f"Discovery failed: {error_code or 'unknown_error'} — {error_message or 'no details'}"
@@ -354,20 +390,20 @@ def find_node(state: GraphState) -> dict[str, Any]:
                 "_event_details": event_details,
             }
 
-        if result.status == ConnectorStatus.NOT_CONFIGURED:
+        if connector is not None and connector.status == ConnectorStatus.NOT_CONFIGURED:
             findings.append(
                 f"Discovery connector {connector.provider} is not configured. "
                 "Running in fixture mode with example candidates."
             )
             event_details["fixture_mode"] = True
 
-        if result.status == ConnectorStatus.SUCCESS_EMPTY:
+        if connector is not None and connector.status == ConnectorStatus.SUCCESS_EMPTY and not candidates:
             findings.append("Discovery returned no candidates for the given criteria.")
             event_details["empty_results"] = True
 
         if candidates:
             findings.append(f"Discovery returned {len(candidates)} candidate companies.")
-            if result.status == ConnectorStatus.NOT_CONFIGURED:
+            if connector is not None and connector.status == ConnectorStatus.NOT_CONFIGURED:
                 event_details["fixture_mode"] = True
 
         # Persist candidates as companies and source records
@@ -375,8 +411,13 @@ def find_node(state: GraphState) -> dict[str, Any]:
         duplicate_companies = []
 
         with session_scope() as db:
-            for candidate in candidates:
+            for provider_name, candidate in candidates:
                 domain = candidate.normalized_domain()
+                # The connector result that produced THIS candidate.
+                candidate_result = results_by_name.get(provider_name)
+                provider_label = (
+                    candidate_result.provider if candidate_result is not None else provider_name
+                )
 
                 # Check for existing company with same domain in this campaign
                 existing = None
@@ -404,9 +445,9 @@ def find_node(state: GraphState) -> dict[str, Any]:
                         SourceRecord(
                             company_id=existing.id,
                             source_type="discovery",
-                            provider=connector.provider,
+                            provider=provider_label,
                             source_url=candidate.source_url,
-                            retrieved_at=result.retrieved_at,
+                            retrieved_at=candidate_result.retrieved_at,
                             raw_payload_json=_dump(
                                 {
                                     "candidate_name": candidate.name,
@@ -440,9 +481,9 @@ def find_node(state: GraphState) -> dict[str, Any]:
                         SourceRecord(
                             company_id=company.id,
                             source_type="discovery",
-                            provider=connector.provider,
+                            provider=provider_label,
                             source_url=candidate.source_url,
-                            retrieved_at=result.retrieved_at,
+                            retrieved_at=candidate_result.retrieved_at,
                             raw_payload_json=_dump(
                                 {
                                     "candidate_name": candidate.name,
@@ -476,14 +517,9 @@ def find_node(state: GraphState) -> dict[str, Any]:
         # We store the first created company's ID for compatibility, or 0 if none.
         first_company_id = created_companies[0]["id"] if created_companies else 0
 
-        # Determine outcome
-        if result.status == ConnectorStatus.SUCCESS_EMPTY:
-            outcome = "continue"  # Empty results is not a failure
-        elif created_companies:
-            outcome = "continue"
-        else:
-            # No new companies and no duplicates = empty effective result
-            outcome = "continue"
+        # Determine outcome — discovery runs always continue; qualification, not
+        # connector success/failure, decides the next routing step.
+        outcome = "continue"
 
         return {
             "stage": "find",

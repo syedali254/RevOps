@@ -21,6 +21,7 @@ from .sec import SECEdgarConnector, get_sec_connector
 from .opencorporates import OpenCorporatesConnector, get_opencorporates_connector
 from .yc import YCDirectoryConnector, get_yc_connector
 from .remoteok import RemoteOKConnector, get_remoteok_connector
+from .hn_hiring import HNHiringConnector, get_hn_connector
 
 __all__ = [
     "BaseConnector",
@@ -52,4 +53,6 @@ __all__ = [
     "get_yc_connector",
     "RemoteOKConnector",
     "get_remoteok_connector",
+    "HNHiringConnector",
+    "get_hn_connector",
 ]
