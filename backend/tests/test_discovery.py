@@ -23,6 +23,7 @@ os.environ["BRAVE_API_KEY"] = ""
 import pytest
 from fastapi.testclient import TestClient
 
+from app.connectors.base import ConnectorStatus
 from app.db import Base, engine, init_db
 from app.main import app
 
@@ -63,6 +64,51 @@ def campaign(client) -> dict:
     )
     assert response.status_code == 201, response.text
     return response.json()
+
+
+# --- shared stubs for deterministic live-source control ---------------------
+
+
+def _stub_result(status, error_code=None, error_message=None, candidates=None):
+    from app.connectors.base import ConnectorResult, ConnectorRole
+
+    return ConnectorResult(
+        source_type="stub",
+        provider="stub",
+        role=ConnectorRole.DISCOVERY,
+        status=status,
+        candidates=candidates or [],
+        error_code=error_code,
+        error_message=error_message,
+    )
+
+
+def _stub_candidate():
+    from app.connectors.base import CandidateCompany
+
+    return CandidateCompany(
+        name="StubCo",
+        website_domain="stubco.example",
+        source_url="https://stubco.example",
+        snippet="stub candidate",
+    )
+
+
+class _StubDiscoveryConnector:
+    """Stand-in for a live connector, returning a canned result."""
+
+    def __init__(self, result):
+        self._result = result
+
+    async def discover(self, query):
+        return self._result
+
+    async def close(self):
+        return None
+
+    @property
+    def provider(self):
+        return "stub"
 
 
 def test_create_discovery_run_fixture_mode(client, campaign):
@@ -115,8 +161,20 @@ def test_discovery_run_creates_companies_with_source_records(client, campaign):
         assert isinstance(discovery_source["raw_payload"], dict)
 
 
-def test_discovery_run_duplicate_handling(client, campaign):
+def test_discovery_run_duplicate_handling(client, campaign, monkeypatch):
     """Running discovery twice should not create duplicate companies."""
+    # Stub the live sources (RemoteOK / HN hit real network otherwise, and the
+    # live candidate mix can shift between the two calls — the guarantee under
+    # test is about de-duplication, not live-data stability).
+    import app.graph as graph
+
+    live_ok = _stub_result(
+        status=ConnectorStatus.SUCCESS_WITH_RESULTS,
+        candidates=[_stub_candidate()],
+    )
+    monkeypatch.setattr(graph, "get_remoteok_connector", lambda: _StubDiscoveryConnector(live_ok))
+    monkeypatch.setattr(graph, "get_hn_connector", lambda: _StubDiscoveryConnector(live_ok))
+
     # First run
     response1 = client.post("/api/discovery", json={"campaign_id": campaign["id"], "max_results": 5})
     assert response1.status_code == 201
@@ -162,6 +220,81 @@ def test_discovery_run_with_fail_at_find(client, campaign):
     companies_response = client.get(f"/api/companies?campaign_id={campaign['id']}&record_kind=retrieved")
     companies = companies_response.json()
     assert len(companies) == 0
+
+
+# --- resilient discovery: one source down must not kill the run -------------
+
+
+def test_single_source_failure_does_not_stop_discovery(client, campaign, monkeypatch):
+    """RemoteOK (or any single source) failing must not kill a run when other
+    live sources succeeded — the failure is recorded, the run continues."""
+    import app.graph as graph
+
+    failed_result = _stub_result(
+        status=ConnectorStatus.FAILED,
+        error_code="fetch_failed",
+        error_message="simulated network failure",
+    )
+
+    monkeypatch.setattr(
+        graph, "get_remoteok_connector", lambda: _StubDiscoveryConnector(failed_result)
+    )
+    monkeypatch.setattr(
+        graph,
+        "get_hn_connector",
+        lambda: _StubDiscoveryConnector(
+            _stub_result(
+                status=ConnectorStatus.SUCCESS_WITH_RESULTS,
+                candidates=[_stub_candidate()],
+            )
+        ),
+    )
+
+    response = client.post(
+        "/api/discovery",
+        json={"campaign_id": campaign["id"], "max_results": 5},
+    )
+    assert response.status_code == 201
+    run = response.json()
+
+    assert run["outcome"] == "continue"
+    assert run["status"] == "completed"
+
+    find_event = next(e for e in run["events"] if e["stage"] == "find")
+    details = find_event["details"]
+    assert details["connector_statuses"]["remoteok"] == "failed"
+    assert "remoteok" in details["degraded_sources"]
+    assert any("remoteok" in note for note in details["degraded_notes"])
+    # Companies were still created from the sources that worked
+    assert details["created_companies"]
+
+
+def test_all_live_sources_failing_still_stops_run(client, campaign, monkeypatch):
+    """If NO live discovery source succeeded, the run must stop honestly."""
+    import app.graph as graph
+
+    failed_result = _stub_result(
+        status=ConnectorStatus.FAILED,
+        error_code="fetch_failed",
+        error_message="simulated total outage",
+    )
+    monkeypatch.setattr(
+        graph, "get_remoteok_connector", lambda: _StubDiscoveryConnector(failed_result)
+    )
+    monkeypatch.setattr(
+        graph, "get_hn_connector", lambda: _StubDiscoveryConnector(failed_result)
+    )
+
+    response = client.post(
+        "/api/discovery",
+        json={"campaign_id": campaign["id"], "max_results": 5},
+    )
+    assert response.status_code == 201
+    run = response.json()
+
+    assert run["outcome"] == "stopped_after_error"
+    assert run["status"] == "failed"
+    assert run["error_code"] == "fetch_failed"
 
 
 def test_list_discovery_runs(client, campaign):

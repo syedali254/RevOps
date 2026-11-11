@@ -252,7 +252,7 @@ def find_node(state: GraphState) -> dict[str, Any]:
         loop = asyncio.new_event_loop()
         all_candidates = []
         connector_results = []
-        hn_notes: list[str] = []  # best-effort notes; merged into the event details
+        degraded_notes: list[str] = []  # best-effort notes; merged into the event details
 
         try:
             # Try Tavily first (live primary)
@@ -284,7 +284,7 @@ def find_node(state: GraphState) -> dict[str, Any]:
                 if hn_result.is_success() and hn_result.candidates:
                     all_candidates.extend(("hn", c) for c in hn_result.candidates)
             except Exception as hn_exc:  # noqa: BLE001 - HN is optional, never fatal
-                hn_notes.append(
+                degraded_notes.append(
                     f"Hacker News hiring connector raised an unexpected error and was skipped: "
                     f"{type(hn_exc).__name__}: {hn_exc}"
                 )
@@ -342,14 +342,26 @@ def find_node(state: GraphState) -> dict[str, Any]:
             connector = connector_results[0][1] if connector_results else brave_result
             connector_status = connector.status.value if connector else "unknown"
 
+        # Resilient discovery: a single source failing (RemoteOK unreachable,
+        # a rate limit, etc.) is recorded honestly but must not kill the run
+        # when other live sources produced real candidates. The run stops only
+        # if NO live discovery source succeeded at all.
+        LIVE_SOURCES = ("tavily", "exa", "remoteok", "hn")
+        failed_sources = [
+            (name, result)
+            for name, result in connector_results
+            if result.status == ConnectorStatus.FAILED
+        ]
+        any_live_success = any(
+            name in LIVE_SOURCES and result.is_success()
+            for name, result in connector_results
+        )
+
         error_code = None
         error_message = None
-        # HN is best-effort: a failure there is recorded, but does not stop discovery.
-        for name, result in connector_results:
-            if result.status == ConnectorStatus.FAILED and name != "hn":
-                error_code = result.error_code
-                error_message = result.error_message
-                break
+        if failed_sources and not any_live_success:
+            error_code = failed_sources[0][1].error_code
+            error_message = failed_sources[0][1].error_message
 
         findings: list[str] = []
         event_details: dict[str, Any] = {
@@ -364,15 +376,21 @@ def find_node(state: GraphState) -> dict[str, Any]:
             },
         }
 
-        # Best-effort HN notes: keep the event honestly degraded instead of failing.
-        if event_details["connector_statuses"].get("hn") == ConnectorStatus.FAILED.value:
-            hn_notes.append(
-                "Hacker News hiring connector is currently unavailable — discovery "
-                "continued with the remaining sources."
-            )
-        if hn_notes:
-            event_details["hn_notes"] = hn_notes
-            findings.extend(hn_notes)
+        # Degraded-source notes: keep the run going, but be honest about what
+        # was unavailable (this replaces the run-stopping error path above).
+        if failed_sources and any_live_success:
+            for name, result in failed_sources:
+                degraded_notes.append(
+                    f"Source '{name}' is currently unavailable ({result.error_code or 'error'}) — "
+                    "discovery continued with the remaining sources."
+                )
+            event_details["degraded_sources"] = {
+                name: {"error_code": result.error_code, "error_message": result.error_message}
+                for name, result in failed_sources
+            }
+        if degraded_notes:
+            event_details["degraded_notes"] = degraded_notes
+            findings.extend(degraded_notes)
 
         if error_code:
             findings.append(
